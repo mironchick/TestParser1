@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CarexKorea - трекер цен</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+  body{font-family:system-ui,sans-serif;max-width:900px;margin:24px auto;padding:0 16px;background:#f6f7f9;color:#222}
+  form{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:24px}
+  select,input{padding:8px;border:1px solid #ccc;border-radius:8px}
+  input[type=number]{width:90px}
+  button{padding:8px 14px;border:0;border-radius:8px;background:#2563eb;color:#fff;cursor:pointer}
+  .util{display:flex;align-items:center;gap:6px;font-size:14px}
+  .card{background:#fff;border-radius:12px;padding:16px;margin-bottom:20px;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+  .head{display:flex;justify-content:space-between;align-items:center}
+  .head h2{margin:0;font-size:18px}
+  .head button{background:#e5e7eb;color:#222;margin-left:6px}
+  canvas{max-height:260px}
+  table{width:100%;border-collapse:collapse;font-size:14px;margin-top:8px}
+  td{padding:4px 8px;border-bottom:1px solid #eee}
+  .down{color:#16a34a;font-weight:600}.up{color:#dc2626;font-weight:600}
+  .changes p{font-size:14px;color:#555}
+</style>
+</head>
+<body>
+<h1>📉 CarexKorea — трекер цен</h1>
+<form id="addForm">
+  <select id="brand"></select>
+  <select id="model" disabled></select>
+  <input id="yf" type="number" placeholder="год от" min="2016" max="2026">
+  <input id="yt" type="number" placeholder="год до" min="2016" max="2026">
+  <label class="util"><input type="checkbox" id="util"> льготный утильсбор</label>
+  <button>Отслеживать</button>
+</form>
+<div id="watches"></div>
+<script>
+const $ = s => document.querySelector(s);
+const fmt = n => n == null ? "—" : n.toLocaleString("ru-RU");
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+async function init() {
+  const brands = await api("/api/brands");
+  $("#brand").innerHTML = '<option value="">Марка</option>' +
+    brands.map(b => `<option value="${b.marka_id}">${b.name}</option>`).join("");
+  loadWatches();
+}
+$("#brand").onchange = async e => {
+  const id = e.target.value;
+  $("#model").disabled = !id;
+  $("#model").innerHTML = "<option>Модель</option>";
+  if (!id) return;
+  const models = await api("/api/models?marka_id=" + id);
+  $("#model").innerHTML = '<option value="">Модель</option>' +
+    models.map(m => `<option>${m}</option>`).join("");
+};
+$("#addForm").onsubmit = async e => {
+  e.preventDefault();
+  const body = {marka_id: +$("#brand").value, model_name: $("#model").value,
+                year_from: +$("#yf").value || null, year_to: +$("#yt").value || null,
+                preferential_recycling: $("#util").checked};
+  if (!body.marka_id || !body.model_name) return alert("Выберите марку и модель");
+  await api("/api/watches", {method: "POST",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+  alert("Добавлено! Первый сбор идёт в фоне (~1 мин), потом нажмите «Обновить».");
+  loadWatches();
+};
+async function loadWatches() {
+  const ws = await api("/api/watches");
+  const box = $("#watches"); box.innerHTML = "";
+  for (const w of ws) {
+    const s = w.latest, p = w.prev;
+    const delta = s && p ? (s.avg_rub - p.avg_rub) / p.avg_rub * 100 : null;
+    const card = document.createElement("div");
+    card.className = "card";
+    card.innerHTML = `
+      <div class="head">
+        <h2>${w.marka_name} ${w.model_name} ${w.year_from || ""}–${w.year_to || ""}${w.preferential_recycling ? " · льготный утиль" : ""}</h2>
+        <span><button onclick="refresh(${w.id})">⟳ Обновить</button>
+              <button onclick="del(${w.id})">✕</button></span>
+      </div>
+      ${s ? `<p>${s.day}: <b>${s.cnt}</b> авто · средняя <b>${fmt(s.avg_rub)} ₽</b>
+        ${delta != null ? `(<span class="${delta < 0 ? 'down' : 'up'}">${delta > 0 ? "+" : ""}${delta.toFixed(1)}%</span> к ${p.day})` : ""}
+        · медиана ${fmt(s.med_rub)} ₽ · диапазон ${fmt(s.min_rub)}–${fmt(s.max_rub)} ₽</p>
+        <canvas id="ch${w.id}"></canvas><div id="chg${w.id}" class="changes"></div>`
+      : "<p>Данных пока нет — идёт первый сбор…</p>"}`;
+    box.appendChild(card);
+    if (s) { drawChart(w.id); loadChanges(w.id); }
+  }
+}
+async function drawChart(id) {
+  const {days} = await api(`/api/watches/${id}/series`);
+  new Chart(document.getElementById("ch" + id), {
+    type: "line",
+    data: {labels: days.map(d => d.day), datasets: [
+      {label: "Средняя, ₽", data: days.map(d => d.avg_rub), borderColor: "#2563eb", tension: .2},
+      {label: "Медиана, ₽", data: days.map(d => d.med_rub), borderColor: "#16a34a", tension: .2}]},
+    options: {plugins: {legend: {position: "bottom"}}}
+  });
+}
+async function loadChanges(id) {
+  const c = await api(`/api/watches/${id}/changes`);
+  if (!c.prev_day) return;
+  const rows = c.changed.slice(0, 8).map(r => `<tr>
+    <td>${r.year}, ${fmt(r.mileage)} км</td>
+    <td>${fmt(r.old_rub)} → ${fmt(r.new_rub)} ₽</td>
+    <td class="${r.delta_rub < 0 ? 'down' : 'up'}">${r.delta_rub > 0 ? "+" : ""}${fmt(r.delta_rub)}</td>
+  </tr>`).join("");
+  document.getElementById("chg" + id).innerHTML =
+    `<p>${c.prev_day} → ${c.day}: цена изменилась у <b>${c.changed.length}</b> авто,
+     новых <b>${c.new.length}</b>, продано/снято <b>${c.gone.length}</b></p>
+     ${rows ? `<table>${rows}</table>` : ""}`;
+}
+async function refresh(id) {
+  await api(`/api/watches/${id}/refresh`, {method: "POST"});
+  alert("Сбор запущен в фоне, обновите страницу через минуту");
+}
+async function del(id) {
+  if (confirm("Удалить отслеживание и историю?")) {
+    await api("/api/watches/" + id, {method: "DELETE"});
+    loadWatches();
+  }
+}
+init();
+</script>
+</body>
+</html>
